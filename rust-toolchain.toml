@@ -1,0 +1,3 @@
+[toolchain]
+# The Xtensa "esp" toolchain installed by `espup install`.
+channel = "esp"

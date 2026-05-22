@@ -1,0 +1,28 @@
+[package]
+name = "justicetattoo"
+version = "0.1.0"
+authors = ["Alex Berliner <alexberliner@gmail.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "justicetattoo"
+harness = false # do not use the built-in cargo test harness on the device target
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # symbols are nice for JTAG debugging via ESP-Prog
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+anyhow = "1"
+esp-idf-svc = "0.51"      # re-exports esp-idf-hal as ::hal and esp-idf-sys as ::sys
+embedded-hal = "1"        # traits the SSD1309 driver is written against
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] } # ESP-IDF linker / sysenv wiring
+image = { version = "0.25", default-features = false, features = ["gif"] }

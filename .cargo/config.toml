@@ -1,0 +1,17 @@
+[build]
+target = "xtensa-esp32-espidf"
+
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+# std must be built from source for the espidf target (needs the rust-src
+# component, installed by `espup install`).
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32"
+# ESP-IDF release that esp-idf-sys checks out and builds on the first compile.
+ESP_IDF_VERSION = "v5.3.3"

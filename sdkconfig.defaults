@@ -1,0 +1,7 @@
+# Rust needs a larger main task stack than the ESP-IDF C default.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
+
+# 4 MB flash. ESP-IDF's built-in "large single app" table gives a ~1.5 MB app
+# partition - room for the std runtime + a short movie's embedded frames.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
