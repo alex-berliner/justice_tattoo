@@ -1,9 +1,11 @@
 //! Compile-time GIF -> SSD1309 frame converter.
 //!
 //! Reads `assets/movie.gif`, stretches every frame to 128x64, applies 8x8 Bayer
-//! ordered dithering to 1-bit, packs into the SSD1309 page layout, and emits:
-//!   * `$OUT_DIR/frames.bin` - concatenated 1024-byte frames
-//!   * `$OUT_DIR/meta.rs`    - FORMAT / FRAME_COUNT / FRAME_DELAYS_MS / dimensions
+//! ordered dithering to 1-bit, and packs into the SSD1309 page layout. Each
+//! frame is then encoded two ways - raw, and XOR-delta + RLE - and the smaller
+//! total wins. It emits:
+//!   * `$OUT_DIR/frames.bin` - the chosen frame blob
+//!   * `$OUT_DIR/meta.rs`    - FORMAT / FRAME_COUNT / FRAME_OFFSETS / delays / dims
 //!
 //! It also runs `embuild::espidf::sysenv::output()` so the ESP-IDF link step
 //! still works - the GIF pipeline and the IDF wiring share this one build script.
@@ -56,56 +58,152 @@ fn convert_gif() {
         .expect("failed to decode GIF frames");
     assert!(!frames.is_empty(), "GIF contains no frames");
 
-    let mut blob: Vec<u8> = Vec::with_capacity(frames.len() * FRAME_BYTES);
+    // Decode + dither + pack every frame into the SSD1309 page layout.
+    let mut packed: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
     let mut delays: Vec<u16> = Vec::with_capacity(frames.len());
-
     for frame in &frames {
         let (num, den) = frame.delay().numer_denom_ms();
         let ms = if den == 0 { 100 } else { num / den };
         delays.push((ms as u16).max(MIN_DELAY_MS));
-
-        // Stretch to exactly 128x64, then reduce to luma.
-        let luma = DynamicImage::ImageRgba8(frame.buffer().clone())
-            .resize_exact(WIDTH, HEIGHT, FilterType::Triangle)
-            .to_luma8();
-
-        // Bayer-dither into the SSD1309 page layout: byte = 8 vertically stacked
-        // pixels, bit 0 = topmost row of the page.
-        let mut packed = vec![0u8; FRAME_BYTES];
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                let lum = luma.get_pixel(x, y).0[0] as u16;
-                let threshold = BAYER8[(y % 8) as usize][(x % 8) as usize] as u16 * 4;
-                if lum > threshold {
-                    let page = (y / 8) as usize;
-                    let bit = y % 8;
-                    packed[page * WIDTH as usize + x as usize] |= 1 << bit;
-                }
-            }
-        }
-        blob.extend_from_slice(&packed);
+        packed.push(pack_frame(frame));
     }
+
+    // Encode raw and delta+RLE; keep whichever blob is smaller.
+    let (format, blob, offsets) = choose_encoding(&packed);
 
     let out_dir = env::var("OUT_DIR").unwrap();
     fs::write(Path::new(&out_dir).join("frames.bin"), &blob).unwrap();
+    write_meta(&out_dir, format, frames.len(), &delays, &offsets);
 
-    let mut meta = fs::File::create(Path::new(&out_dir).join("meta.rs")).unwrap();
+    let raw_total = packed.len() * FRAME_BYTES;
+    println!(
+        "cargo:warning=movie: {} frames, FORMAT={} ({}), {} bytes ({}% of raw {})",
+        frames.len(),
+        format,
+        if format == 0 { "raw" } else { "delta+RLE" },
+        blob.len(),
+        blob.len() * 100 / raw_total.max(1),
+        raw_total,
+    );
+}
+
+/// Stretch one GIF frame to 128x64, Bayer-dither to 1-bit, and pack it into the
+/// SSD1309 page layout: each byte is 8 vertically stacked pixels, bit 0 = top.
+fn pack_frame(frame: &image::Frame) -> Vec<u8> {
+    let luma = DynamicImage::ImageRgba8(frame.buffer().clone())
+        .resize_exact(WIDTH, HEIGHT, FilterType::Triangle)
+        .to_luma8();
+    let mut packed = vec![0u8; FRAME_BYTES];
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let lum = luma.get_pixel(x, y).0[0] as u16;
+            let threshold = BAYER8[(y % 8) as usize][(x % 8) as usize] as u16 * 4;
+            if lum > threshold {
+                let page = (y / 8) as usize;
+                packed[page * WIDTH as usize + x as usize] |= 1u8 << (y % 8);
+            }
+        }
+    }
+    packed
+}
+
+/// Encode the packed frames raw and as XOR-delta + RLE; return the smaller.
+/// Result is `(format, blob, offsets)` where frame `i` is `blob[offsets[i]..[i+1]]`.
+fn choose_encoding(packed: &[Vec<u8>]) -> (u8, Vec<u8>, Vec<u32>) {
+    // Raw: each frame is a verbatim 1024-byte page buffer.
+    let mut raw = Vec::with_capacity(packed.len() * FRAME_BYTES);
+    let mut raw_offsets = vec![0u32];
+    for f in packed {
+        raw.extend_from_slice(f);
+        raw_offsets.push(raw.len() as u32);
+    }
+
+    // Delta+RLE: frame 0 is XORed against zeros (so it stands alone); every
+    // later frame is XORed against its predecessor, then run-length encoded.
+    let mut delta = Vec::new();
+    let mut delta_offsets = vec![0u32];
+    let mut prev = vec![0u8; FRAME_BYTES];
+    for f in packed {
+        let diff: Vec<u8> = f.iter().zip(&prev).map(|(a, b)| a ^ b).collect();
+        delta.extend_from_slice(&rle_encode(&diff));
+        delta_offsets.push(delta.len() as u32);
+        prev.clone_from(f);
+    }
+
+    if delta.len() < raw.len() {
+        (1, delta, delta_offsets)
+    } else {
+        (0, raw, raw_offsets)
+    }
+}
+
+/// Run-length encode one XOR-delta buffer.
+///
+/// Op stream of 2-byte little-endian headers: bit 15 = type (0 = COPY, an
+/// unchanged run; 1 = XOR, a literal run), bits 0..14 = run length. XOR ops are
+/// followed by `len` literal delta bytes. Short zero gaps inside a changed
+/// region are absorbed into the literal run rather than split into their own op.
+fn rle_encode(diff: &[u8]) -> Vec<u8> {
+    const ZERO_GAP: usize = 4; // shorter zero runs stay inside a literal run
+    let n = diff.len();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < n {
+        if diff[pos] == 0 {
+            let start = pos;
+            while pos < n && diff[pos] == 0 {
+                pos += 1;
+            }
+            emit_op(&mut out, false, pos - start, &[]);
+        } else {
+            let start = pos;
+            while pos < n {
+                if diff[pos] != 0 {
+                    pos += 1;
+                } else {
+                    let mut z = pos;
+                    while z < n && diff[z] == 0 {
+                        z += 1;
+                    }
+                    if z - pos >= ZERO_GAP {
+                        break;
+                    }
+                    pos = z; // absorb the short gap
+                }
+            }
+            emit_op(&mut out, true, pos - start, &diff[start..pos]);
+        }
+    }
+    out
+}
+
+fn emit_op(out: &mut Vec<u8>, is_xor: bool, len: usize, literals: &[u8]) {
+    assert!((1..=0x7FFF).contains(&len), "RLE run out of range: {len}");
+    let header = len as u16 | if is_xor { 0x8000 } else { 0 };
+    out.extend_from_slice(&header.to_le_bytes());
+    if is_xor {
+        out.extend_from_slice(literals);
+    }
+}
+
+fn write_meta(out_dir: &str, format: u8, count: usize, delays: &[u16], offsets: &[u32]) {
+    let mut meta = fs::File::create(Path::new(out_dir).join("meta.rs")).unwrap();
     writeln!(meta, "// Auto-generated by build.rs - do not edit.").unwrap();
-    writeln!(meta, "/// Frame encoding: 0 = raw page-packed. Reserved for delta+RLE.").unwrap();
-    writeln!(meta, "pub const FORMAT: u8 = 0;").unwrap();
+    writeln!(meta, "/// Frame encoding: 0 = raw page-packed, 1 = XOR-delta + RLE.").unwrap();
+    writeln!(meta, "pub const FORMAT: u8 = {format};").unwrap();
     writeln!(meta, "pub const WIDTH: usize = {WIDTH};").unwrap();
     writeln!(meta, "pub const HEIGHT: usize = {HEIGHT};").unwrap();
     writeln!(meta, "pub const FRAME_BYTES: usize = {FRAME_BYTES};").unwrap();
-    writeln!(meta, "pub const FRAME_COUNT: usize = {};", frames.len()).unwrap();
+    writeln!(meta, "pub const FRAME_COUNT: usize = {count};").unwrap();
     write!(meta, "pub const FRAME_DELAYS_MS: [u16; {}] = [", delays.len()).unwrap();
-    for d in &delays {
+    for d in delays {
         write!(meta, "{d},").unwrap();
     }
     writeln!(meta, "];").unwrap();
-
-    println!(
-        "cargo:warning=movie: {} frames, {} bytes total",
-        frames.len(),
-        blob.len()
-    );
+    // FRAME_OFFSETS has FRAME_COUNT + 1 entries; frame i is [OFFSETS[i]..[i+1]].
+    write!(meta, "pub const FRAME_OFFSETS: [u32; {}] = [", offsets.len()).unwrap();
+    for o in offsets {
+        write!(meta, "{o},").unwrap();
+    }
+    writeln!(meta, "];").unwrap();
 }

@@ -23,7 +23,7 @@ script — the device itself only blits pre-baked frames.
 **Display facts that drive the design:** SSD1309 controller, **128×64**,
 **monochrome** (transparent light-blue). Native framebuffer = 8 pages × 128
 columns, vertical bit-packing → **1024 bytes per full frame**. A 4 MB flash
-therefore holds thousands of frames; no compression is required for a short loop.
+therefore holds thousands of frames; delta+RLE compression (§9) stretches that further.
 
 ### Suggested wiring (ESP32 VSPI defaults)
 
@@ -49,7 +49,7 @@ the flash to 1.8 V. The board's flash-voltage eFuse was burned to 3.3 V on
 | Rust runtime | **`std` + `esp-idf-hal`** (via `esp-idf-svc`) | Official esp-rs crate, mature. Leaves the door open to Wi-Fi/BLE/filesystem later. |
 | 1-bit conversion | **Bayer / ordered dithering** (8×8) | Temporally stable — static areas stay still between frames; no shimmer/boil that error-diffusion causes on video. |
 | Aspect handling | **Stretch** to exactly 128×64 | Decided by user. No bars, no cropping; accepts distortion. |
-| Frame storage | **Raw 1 KB frames**, format-versioned | Simplest. A `FORMAT` byte in generated metadata leaves a clean seam for delta+RLE later. |
+| Frame storage | **Raw or XOR-delta + RLE**, auto-selected | `build.rs` encodes both and keeps the smaller; a `FORMAT` byte tells the device which decoder to use. See §9. |
 
 ## 4. Architecture
 
@@ -60,8 +60,10 @@ the flash to 1.8 V. The board's flash-voltage eFuse was burned to 3.3 V on
    fully-composited RGBA frames + per-frame delays; handles GIF disposal).
 3. Per frame: `resize_exact(128, 64)` (stretch) → luma → **8×8 Bayer ordered
    dither** to 1-bit → pack into native SSD1309 page layout (8 pages × 128 cols).
-4. Emit `OUT_DIR/frames.bin` (concatenated 1 KB frames) and `OUT_DIR/meta.rs`
-   with `FORMAT: u8` (0 = raw), `FRAME_COUNT`, `FRAME_DELAYS_MS: [u16; N]`.
+4. Encode all frames two ways — raw, and XOR-delta + RLE — and keep the smaller.
+   Emit `OUT_DIR/frames.bin` (the chosen blob) and `OUT_DIR/meta.rs` with
+   `FORMAT: u8` (0 = raw, 1 = delta+RLE), `FRAME_COUNT`, `FRAME_DELAYS_MS`, and
+   `FRAME_OFFSETS` (per-frame byte ranges into the blob).
 5. Then call `embuild::espidf::sysenv::output()` (the esp-idf-sys linker setup —
    the GIF pipeline and the IDF setup share one `build.rs`).
 
@@ -71,9 +73,10 @@ the flash to 1.8 V. The board's flash-voltage eFuse was burned to 3.3 V on
   DC and RST.
 - Thin hand-written SSD1309 driver: ~20-command init (SSD1306-compatible set)
   with a proper RST low-pulse, plus a one-SPI-transaction full-frame blit.
-- Playback loop: `decode_frame(i)` (today: a 1 KB slice of `FRAMES`; later: a
-  `match FORMAT` that applies an XOR delta into a RAM buffer) → blit → sleep for
-  the GIF frame delay (clamped to a ~30 ms minimum) → wrap around.
+- Playback loop: `render_frame(i)` decodes into one reusable 1 KB framebuffer —
+  raw frames are copied in, delta+RLE frames apply an XOR delta in place (the
+  buffer resets at the loop start). Then blit → sleep for the GIF frame delay
+  (clamped to a ~30 ms minimum) → wrap around.
 
 ### Project layout
 
@@ -87,7 +90,10 @@ justicetattoo/
 ├── sdkconfig.defaults    # flash size + large-app partition table
 ├── .cargo/config.toml    # target xtensa-esp32-espidf, build-std, espflash runner
 ├── assets/movie.gif      # the movie (placeholder until the real one is dropped in)
-└── src/main.rs
+├── tools/                # make_placeholder_gif.py, rle_roundtrip.rs
+└── src/
+    ├── main.rs           # peripheral init, playback loop, delta+RLE decoder
+    └── ssd1309.rs        # minimal SSD1309 driver (init + full-frame blit)
 ```
 
 ### Flash budget note
@@ -134,9 +140,20 @@ espflash monitor             # serial monitor only
 Replace `assets/movie.gif`, then `cargo build`. `build.rs` re-runs automatically
 (`rerun-if-changed`). Keep the GIF short; every frame costs 1 KB of flash.
 
-## 9. Future work — delta + RLE compression
+## 9. Delta + RLE compression (implemented)
 
-The `FORMAT` byte in `meta.rs` and the `decode_frame()` seam in `main.rs` reserve
-the path: `build.rs` would XOR each frame against the previous and run-length
-encode; the device decodes into a single 1 KB RAM working buffer. Deferred until
-a movie is long enough to need it.
+`build.rs` encodes the frames two ways and keeps the smaller:
+
+- **Raw** — each frame verbatim, 1024 bytes.
+- **XOR-delta + RLE** — frame 0 is XORed against zero, every later frame against
+  its predecessor; the sparse delta is run-length encoded with 2-byte op headers
+  (bit 15 = type: COPY of an unchanged run, or XOR of a literal run; bits 0..14 =
+  run length).
+
+The `FORMAT` byte in `meta.rs` records the choice; `main.rs` decodes both into
+one reusable 1 KB framebuffer (`render_frame` / `apply_delta_rle`). For the
+placeholder movie this is a ~7× win (36 KB raw → 5 KB). `tools/rle_roundtrip.rs`
+is a host-side test proving the encoder and decoder agree (1904 cases).
+
+Possible future step: a varint length field, or periodic keyframes for very long
+movies — not needed yet.

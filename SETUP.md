@@ -129,9 +129,11 @@ espflash monitor
    128×64).
 2. `cargo build` — `build.rs` re-runs automatically (`rerun-if-changed`).
 
-Keep the movie short: every frame costs **1024 bytes** of flash. The
-`SINGLE_APP_LARGE` partition table gives a ~1.5 MB app partition; the firmware,
-the std runtime, and all frames must fit inside it together.
+Frames are stored raw (1024 bytes each) or XOR-delta + RLE compressed —
+`build.rs` picks whichever is smaller and prints the result as a `cargo:warning`.
+Movies with static regions compress a lot; busy ones approach 1 KB/frame. The
+`SINGLE_APP_LARGE` partition gives a ~1.5 MB app partition; the firmware, the std
+runtime, and all frames must fit inside it together.
 
 Regenerate the placeholder instead:
 
@@ -154,9 +156,10 @@ justicetattoo/
 ├── .cargo/config.toml    # target, linker, runner, build-std, ESP_IDF_VERSION
 ├── assets/movie.gif      # the movie (placeholder until replaced)
 ├── tools/
-│   └── make_placeholder_gif.py
+│   ├── make_placeholder_gif.py
+│   └── rle_roundtrip.rs  # host test: delta+RLE encoder vs decoder
 └── src/
-    ├── main.rs           # peripheral init + playback loop
+    ├── main.rs           # peripheral init, playback loop, delta+RLE decoder
     └── ssd1309.rs        # minimal SSD1309 driver (init + full-frame blit)
 ```
 
