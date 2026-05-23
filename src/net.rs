@@ -2,8 +2,8 @@
 //! DNS responder.
 //!
 //! The device is its own access point - no router. A phone or laptop joins the
-//! `JusticeTattoo` network; the captive-portal DNS points every hostname at the
-//! device, so the browser opens the upload page. The page converts a GIF to a
+//! device's SoftAP (the SSID embeds the URL to open); the captive-portal DNS
+//! points every hostname at the device, so the browser opens the upload page. The page converts a GIF to a
 //! JTM1 blob and POSTs it to `/upload`, which streams it into the `movie` flash
 //! partition and reboots into the new movie.
 
@@ -27,7 +27,7 @@ use crate::movie::MovieWriter;
 /// so it shows up right in the phone's Wi-Fi list - a fallback for when the
 /// captive portal does not pop. It must fit in 32 bytes; WPA2 needs a password
 /// of >= 8 characters.
-const SSID: &str = "JusticeTattoo 192.168.71.1";
+const SSID: &str = "Tattoo http://192.168.71.1";
 const PASSWORD: &str = "justicetattoo";
 
 /// The SoftAP gateway address. esp-idf-svc's default AP netif lives on the

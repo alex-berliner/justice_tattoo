@@ -45,10 +45,10 @@ Wiring (OLED → ESP32):
 
 ### Over Wi-Fi — the normal way
 
-1. Join the **`JusticeTattoo 192.168.71.1`** Wi-Fi network (password
-   `justicetattoo`) — the network name itself tells you the address.
+1. Join the **`Tattoo http://192.168.71.1`** Wi-Fi network (password
+   `justicetattoo`) — the network name itself is the URL to open.
 2. The upload page opens automatically (captive portal); if not, browse to the
-   address in the network name, `http://192.168.71.1/`.
+   URL in the network name, `http://192.168.71.1/`.
 3. Drop in a `.gif`, check the preview, and **Send to device**.
 4. The device stores it and reboots into the new movie.
 

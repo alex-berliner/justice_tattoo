@@ -116,8 +116,8 @@ Boot sequence:
 
 1. Take peripherals; bring up SPI + GPIO; reset and init the OLED.
 2. NVS + system event loop; start Wi-Fi as a **SoftAP** — SSID
-   `JusticeTattoo 192.168.71.1` (the name embeds the address to open), WPA2,
-   channel 1, fixed gateway `192.168.71.1`.
+   `Tattoo http://192.168.71.1` (the name is the URL to open), WPA2, channel 1,
+   fixed gateway `192.168.71.1`.
 3. Spawn the **captive-portal DNS** thread: a UDP socket on `:53` that answers
    every query with `192.168.71.1`, so joining the network auto-opens the page.
 4. Start the **HTTP server**:
@@ -202,7 +202,7 @@ Wi-Fi/HTTP and the custom partition table forces one ESP-IDF reconfigure.
 
 ## 7. Changing the movie
 
-- **End user (the normal path):** join the `JusticeTattoo 192.168.71.1` network, the
+- **End user (the normal path):** join the `Tattoo http://192.168.71.1` network, the
   upload page opens, drop in a `.gif`. The device converts it in the browser,
   stores it, and reboots into it. No cable, no tools.
 - **The baked-in default:** replace `assets/movie.gif`, then `cargo build` +

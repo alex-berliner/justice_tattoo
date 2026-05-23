@@ -129,8 +129,8 @@ espflash monitor
 
 The device hosts its own network and an upload page:
 
-1. Join the **`JusticeTattoo 192.168.71.1`** Wi-Fi network (password
-   `justicetattoo`) — the network name itself carries the address.
+1. Join the **`Tattoo http://192.168.71.1`** Wi-Fi network (password
+   `justicetattoo`) — the network name itself is the URL to open.
 2. The upload page opens automatically (captive portal). If it does not, open
    `http://192.168.71.1/` in any browser.
 3. Drop in a `.gif`. The browser converts it; check the preview and the
@@ -234,7 +234,7 @@ MTMS=GPIO14, MTDO=GPIO15, + GND. Drive it with `probe-rs`
 | `Failed to connect to on-device flash` | ESP-Prog JTAG straps flash to 1.8 V — burn the flash-voltage eFuse, see §9. |
 | `espflash monitor`: *Failed to initialize input reader* | Monitor needs an interactive terminal; run it from a real shell, not a script. |
 | App image too large to flash | The firmware outgrew the 1.875 MB `factory` partition — build with `--release`, or shrink the baked-in `assets/movie.gif`. |
-| No `JusticeTattoo …` Wi-Fi network appears | Wi-Fi failed to start — check the serial monitor. The device still plays the default movie. |
+| No `Tattoo …` Wi-Fi network appears | Wi-Fi failed to start — check the serial monitor. The device still plays the default movie. |
 | Upload page errors converting a GIF | The file isn't a valid GIF (e.g. a renamed WebP/APNG) — re-export it as a standard GIF. |
 | Uploaded movie too big | The capacity bar on the page exceeded 100% — use a shorter GIF; the `movie` partition is ~2 MB. |
 | First build seems hung | It is cloning + compiling ESP-IDF. Check progress: `tail -f /tmp/justicetattoo-build.log`. |
