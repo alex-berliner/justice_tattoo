@@ -1,7 +1,14 @@
-# Rust needs a larger main task stack than the ESP-IDF C default.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
+# Rust needs a larger main task stack than the ESP-IDF C default; Wi-Fi + HTTP
+# bring-up plus the playback loop all run on it.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
-# 4 MB flash. ESP-IDF's built-in "large single app" table gives a ~1.5 MB app
-# partition - room for the std runtime + a short movie's embedded frames.
+# 4 MB flash with a custom partition table (see partitions.csv): a 1.875 MB
+# factory app partition plus a dedicated ~2 MB "movie" partition for the
+# wirelessly-uploaded movie.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+# esp-idf-sys runs the ESP-IDF CMake build from a generated directory six levels
+# under the repo root (target/<triple>/<profile>/build/esp-idf-sys-*/out/) and
+# resolves this filename relative to it - hence the `../` climb back to the root
+# where partitions.csv lives.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions.csv"

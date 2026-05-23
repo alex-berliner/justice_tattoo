@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<!--
+  justicetattoo — browser-side GIF → JTM1 converter + uploader.
+
+  Served from the device's flash (see src/net.rs). The GIF is decoded and
+  converted entirely in the browser: the WROOM-32 has no RAM to decode arbitrary
+  GIFs, but the browser already has gigabytes of RAM. The device only ever
+  receives finished, page-packed frames.
+
+  Decoding uses a small built-in GIF decoder (LZW + frame compositing) — no
+  external library, no CDN, and no WebCodecs. It works in any browser with a
+  <canvas>, including phone and captive-portal browsers.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>justicetattoo — load a movie</title>
+<style>
+  :root { --bg:#0a0c10; --panel:#151922; --ink:#e7ecf3; --dim:#7d8794; --accent:#35d6e8; }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; min-height:100vh; background:var(--bg); color:var(--ink);
+    font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    display:flex; flex-direction:column; align-items:center; padding:24px 16px;
+  }
+  h1 { margin:.2em 0 0; font-size:1.5rem; letter-spacing:.02em; }
+  h1 span { color:var(--accent); }
+  p.sub { margin:.2em 0 1.4em; color:var(--dim); text-align:center; }
+  main { width:100%; max-width:420px; }
+  #drop {
+    border:2px dashed #2c3442; border-radius:14px; background:var(--panel);
+    padding:34px 18px; text-align:center; cursor:pointer; transition:.15s;
+  }
+  #drop.hot { border-color:var(--accent); background:#192029; }
+  #drop b { color:var(--accent); }
+  #drop small { color:var(--dim); display:block; margin-top:6px; }
+  .card {
+    background:var(--panel); border-radius:14px; padding:16px; margin-top:16px;
+  }
+  .hidden { display:none; }
+  canvas#preview {
+    width:100%; image-rendering:pixelated; background:#000; border-radius:8px;
+    aspect-ratio:2/1;
+  }
+  .stats { display:flex; justify-content:space-between; margin-top:12px; font-size:.9rem; }
+  .stats div { text-align:center; flex:1; }
+  .stats b { display:block; font-size:1.15rem; color:var(--accent); }
+  .warn { color:#ffb454; }
+  button {
+    width:100%; margin-top:14px; padding:14px; border:0; border-radius:10px;
+    background:var(--accent); color:#04212a; font-size:1rem; font-weight:700;
+    cursor:pointer;
+  }
+  button:disabled { background:#2c3442; color:var(--dim); cursor:not-allowed; }
+  #status { margin-top:14px; text-align:center; color:var(--dim); min-height:1.5em; }
+  #status.ok { color:var(--accent); }
+  #status.err { color:#ff6b6b; }
+</style>
+</head>
+<body>
+  <h1>justice<span>tattoo</span></h1>
+  <p class="sub">Drop in a GIF — it plays on the screen.</p>
+
+  <main>
+    <div id="drop">
+      <b>Choose a GIF</b> or drop one here
+      <small>converted in your browser, then sent to the device</small>
+    </div>
+    <input id="file" type="file" accept="image/gif" class="hidden">
+
+    <div id="result" class="card hidden">
+      <canvas id="preview" width="128" height="64"></canvas>
+      <div class="stats">
+        <div><b id="nFrames">0</b>frames</div>
+        <div><b id="size">0</b>movie size</div>
+        <div><b id="budget">0%</b>of capacity</div>
+      </div>
+      <button id="send" disabled>Send to device</button>
+    </div>
+
+    <div id="status"></div>
+  </main>
+
+<script>
+"use strict";
+
+// SSD1309 panel geometry and the movie-partition budget (see partitions.csv:
+// the "movie" partition is 0x210000 bytes).
+const W = 128, H = 64, FRAME_BYTES = 1024;
+const MOVIE_PARTITION_BYTES = 0x210000;
+const MIN_DELAY_MS = 30;
+
+// 8x8 Bayer ordered-dither matrix — identical to build.rs's BAYER8.
+const BAYER8 = [
+  [ 0,32, 8,40, 2,34,10,42],
+  [48,16,56,24,50,18,58,26],
+  [12,44, 4,36,14,46, 6,38],
+  [60,28,52,20,62,30,54,22],
+  [ 3,35,11,43, 1,33, 9,41],
+  [51,19,59,27,49,17,57,25],
+  [15,47, 7,39,13,45, 5,37],
+  [63,31,55,23,61,29,53,21],
+];
+
+const $ = (id) => document.getElementById(id);
+const drop = $("drop"), fileInput = $("file"), result = $("result"),
+      sendBtn = $("send"), statusEl = $("status");
+const tick = () => new Promise((r) => setTimeout(r));
+
+let movieBlob = null;          // the assembled JTM1 Uint8Array, ready to upload
+let previewTimer = null;
+
+function setStatus(msg, kind) {
+  statusEl.textContent = msg;
+  statusEl.className = kind || "";
+}
+
+// --- File intake -----------------------------------------------------------
+drop.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => fileInput.files[0] && handleFile(fileInput.files[0]));
+["dragenter", "dragover"].forEach((e) =>
+  drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.add("hot"); }));
+["dragleave", "drop"].forEach((e) =>
+  drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove("hot"); }));
+drop.addEventListener("drop", (ev) => {
+  const f = ev.dataTransfer.files[0];
+  if (f) handleFile(f);
+});
+
+async function handleFile(file) {
+  if (!/gif/i.test(file.type) && !/\.gif$/i.test(file.name)) {
+    setStatus("That isn't a GIF.", "err");
+    return;
+  }
+  result.classList.add("hidden");
+  sendBtn.disabled = true;
+  movieBlob = null;
+  if (previewTimer) { clearTimeout(previewTimer); previewTimer = null; }
+  try {
+    await convert(await file.arrayBuffer());
+  } catch (e) {
+    setStatus("Couldn't convert that GIF: " + e.message, "err");
+  }
+}
+
+// --- GIF -> JTM1 conversion -----------------------------------------------
+async function convert(arrayBuffer) {
+  setStatus("Decoding GIF…");
+  await tick();                               // let the status paint
+  const gif = parseGif(new Uint8Array(arrayBuffer));
+  const { width: gw, height: gh } = gif;
+
+  // Logical-screen compositing buffer (RGBA), starts fully transparent.
+  const screen = new Uint8ClampedArray(gw * gh * 4);
+  // Offscreen canvases: logical size, then stretched to 128x64 over black
+  // (black backing makes transparent GIF regions read as "off").
+  const logical = document.createElement("canvas");
+  logical.width = gw; logical.height = gh;
+  const lctx = logical.getContext("2d");
+  const cv = document.createElement("canvas");
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+
+  const frames = [], delays = [];
+  for (let i = 0; i < gif.frames.length; i++) {
+    const f = gif.frames[i];
+    setStatus(`Converting frame ${i + 1} / ${gif.frames.length}…`);
+
+    const snapshot = f.disposal === 3 ? screen.slice() : null;
+    blitFrame(screen, gw, gh, f, false);      // composite this frame
+
+    lctx.putImageData(new ImageData(screen, gw, gh), 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+    ctx.drawImage(logical, 0, 0, W, H);       // stretch to 128x64
+    frames.push(packFrame(ctx.getImageData(0, 0, W, H).data));
+    delays.push(Math.max(MIN_DELAY_MS, Math.min(f.delayMs, 65535)));
+
+    // Apply this frame's disposal before compositing the next one.
+    if (f.disposal === 2) blitFrame(screen, gw, gh, f, true);     // clear rect
+    else if (f.disposal === 3 && snapshot) screen.set(snapshot);  // restore
+
+    if ((i & 7) === 0) await tick();          // keep the UI responsive
+  }
+
+  movieBlob = buildJTM1(frames, delays);
+  showResult(frames, delays);
+}
+
+// Composite frame `f` onto the logical screen buffer (or, if `clear`, erase its
+// rectangle back to transparent — the "restore to background" disposal).
+function blitFrame(screen, gw, gh, f, clear) {
+  for (let row = 0; row < f.h; row++) {
+    const cy = f.y + row;
+    if (cy < 0 || cy >= gh) continue;
+    for (let col = 0; col < f.w; col++) {
+      const cx = f.x + col;
+      if (cx < 0 || cx >= gw) continue;
+      const o = (cy * gw + cx) * 4;
+      if (clear) {
+        screen[o] = screen[o + 1] = screen[o + 2] = screen[o + 3] = 0;
+        continue;
+      }
+      const idx = f.indices[row * f.w + col];
+      if (idx === f.transparent) continue;
+      const c = f.ct[idx];
+      if (!c) continue;
+      screen[o] = c[0]; screen[o + 1] = c[1]; screen[o + 2] = c[2]; screen[o + 3] = 255;
+    }
+  }
+}
+
+// Minimal GIF87a/89a decoder: returns { width, height, frames:[{x,y,w,h,
+// indices,ct,transparent,disposal,delayMs}] }. Each frame's `indices` are raw
+// color-table indices; compositing happens in convert().
+function parseGif(d) {
+  if (d.length < 13 || d[0] !== 0x47 || d[1] !== 0x49 || d[2] !== 0x46) {
+    throw new Error("not a GIF file");
+  }
+  let p = 6;
+  const rd16 = () => { const v = d[p] | (d[p + 1] << 8); p += 2; return v; };
+  const width = rd16(), height = rd16();
+  const packed = d[p++];
+  p += 2;                                     // skip background colour + aspect
+  let gct = null;
+  if (packed & 0x80) {
+    const n = 2 << (packed & 7);
+    gct = readColorTable(d, p, n); p += n * 3;
+  }
+
+  const frames = [];
+  let gce = { disposal: 0, transparent: -1, delayMs: 100 };
+
+  while (p < d.length) {
+    const block = d[p++];
+    if (block === 0x3B) break;                // trailer
+    if (block === 0x21) {                     // extension
+      const label = d[p++];
+      if (label === 0xF9) {                   // graphic control extension
+        p++;                                  // block size (4)
+        const flags = d[p++];
+        const delay = rd16();
+        const trans = d[p++];
+        p++;                                  // block terminator
+        gce = {
+          disposal: (flags >> 2) & 7,
+          transparent: (flags & 1) ? trans : -1,
+          delayMs: delay === 0 ? 100 : delay * 10,
+        };
+      } else {                                // comment / application / etc.
+        while (p < d.length && d[p] !== 0) p += d[p] + 1;
+        p++;
+      }
+    } else if (block === 0x2C) {              // image descriptor
+      const x = rd16(), y = rd16(), w = rd16(), h = rd16();
+      const ipacked = d[p++];
+      let ct = gct;
+      if (ipacked & 0x80) {
+        const n = 2 << (ipacked & 7);
+        ct = readColorTable(d, p, n); p += n * 3;
+      }
+      if (!ct) throw new Error("GIF frame has no colour table");
+      const minCode = d[p++];
+      // Gather the LZW image data sub-blocks into one buffer.
+      let size = 0, q = p;
+      while (q < d.length && d[q] !== 0) { size += d[q]; q += d[q] + 1; }
+      const lzw = new Uint8Array(size);
+      let o = 0; q = p;
+      while (q < d.length && d[q] !== 0) {
+        const len = d[q++];
+        lzw.set(d.subarray(q, q + len), o);
+        o += len; q += len;
+      }
+      p = q + 1;
+      let indices = lzwDecode(minCode, lzw, w * h);
+      if (ipacked & 0x40) indices = deinterlace(indices, w, h);
+      frames.push({
+        x, y, w, h, indices, ct,
+        transparent: gce.transparent, disposal: gce.disposal, delayMs: gce.delayMs,
+      });
+      gce = { disposal: 0, transparent: -1, delayMs: 100 };
+    } else {
+      break;                                  // unknown block — stop
+    }
+  }
+  if (!frames.length) throw new Error("GIF has no frames");
+  return { width, height, frames };
+}
+
+function readColorTable(d, off, n) {
+  const t = new Array(n);
+  for (let i = 0; i < n; i++) t[i] = [d[off + i * 3], d[off + i * 3 + 1], d[off + i * 3 + 2]];
+  return t;
+}
+
+// GIF LZW decompressor — returns `pixelCount` colour-table indices.
+function lzwDecode(minCodeSize, data, pixelCount) {
+  const clearCode = 1 << minCodeSize;
+  const eoiCode = clearCode + 1;
+  const out = new Uint8Array(pixelCount);
+  let outPos = 0, codeSize = minCodeSize + 1, dict = [];
+  const initDict = () => {
+    dict = new Array(clearCode + 2);
+    for (let i = 0; i < clearCode; i++) dict[i] = [i];
+    codeSize = minCodeSize + 1;
+  };
+  initDict();
+
+  let bitPos = 0;
+  const totalBits = data.length * 8;
+  const readCode = () => {
+    let code = 0;
+    for (let i = 0; i < codeSize; i++) {
+      if (bitPos >= totalBits) return eoiCode;
+      code |= ((data[bitPos >> 3] >> (bitPos & 7)) & 1) << i;
+      bitPos++;
+    }
+    return code;
+  };
+
+  let prev = null;
+  while (outPos < pixelCount) {
+    const code = readCode();
+    if (code === eoiCode) break;
+    if (code === clearCode) { initDict(); prev = null; continue; }
+    let entry;
+    if (code < dict.length && dict[code]) entry = dict[code];
+    else if (code === dict.length && prev) entry = prev.concat(prev[0]);
+    else break;                               // corrupt stream
+    for (let i = 0; i < entry.length && outPos < pixelCount; i++) out[outPos++] = entry[i];
+    if (prev) {
+      dict.push(prev.concat(entry[0]));
+      if (dict.length === (1 << codeSize) && codeSize < 12) codeSize++;
+    }
+    prev = entry;
+  }
+  return out;
+}
+
+// Reorder the rows of an interlaced GIF frame into top-to-bottom order.
+function deinterlace(src, w, h) {
+  const dst = new Uint8Array(w * h);
+  const passes = [[0, 8], [4, 8], [2, 4], [1, 2]];
+  let srcRow = 0;
+  for (const [start, step] of passes) {
+    for (let row = start; row < h; row += step) {
+      dst.set(src.subarray(srcRow * w, srcRow * w + w), row * w);
+      srcRow++;
+    }
+  }
+  return dst;
+}
+
+// Luma + 8x8 Bayer dither + SSD1309 page packing. Mirrors build.rs::pack_frame:
+// each byte is 8 vertically stacked pixels, bit 0 = top.
+function packFrame(rgba) {
+  const out = new Uint8Array(FRAME_BYTES);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      const lum = 0.2126 * rgba[i] + 0.7152 * rgba[i + 1] + 0.0722 * rgba[i + 2];
+      if (lum > BAYER8[y & 7][x & 7] * 4) {
+        out[(y >> 3) * W + x] |= 1 << (y & 7);
+      }
+    }
+  }
+  return out;
+}
+
+// Assemble a JTM1 blob (format 0, raw frames). See PLAN.md §4.
+function buildJTM1(frames, delays) {
+  const n = frames.length;
+  const headerLen = 8 + 2 * n + 4 * (n + 1);
+  const buf = new Uint8Array(headerLen + FRAME_BYTES * n);
+  const dv = new DataView(buf.buffer);
+  buf.set([0x4a, 0x54, 0x4d, 0x31]);          // magic "JTM1"
+  dv.setUint8(4, 0);                          // format = raw
+  dv.setUint8(5, 0);                          // reserved
+  dv.setUint16(6, n, true);                   // frame_count
+  let p = 8;
+  for (let i = 0; i < n; i++, p += 2) dv.setUint16(p, delays[i], true);
+  for (let i = 0; i <= n; i++, p += 4) dv.setUint32(p, i * FRAME_BYTES, true);
+  for (let i = 0; i < n; i++, p += FRAME_BYTES) buf.set(frames[i], p);
+  return buf;
+}
+
+// --- Result + preview ------------------------------------------------------
+function showResult(frames, delays) {
+  const bytes = movieBlob.length;
+  const pct = Math.round((bytes / MOVIE_PARTITION_BYTES) * 100);
+  $("nFrames").textContent = frames.length;
+  $("size").textContent = (bytes / 1024).toFixed(0) + " KB";
+  const budgetEl = $("budget");
+  budgetEl.textContent = pct + "%";
+
+  result.classList.remove("hidden");
+  playPreview(frames, delays);
+
+  if (bytes > MOVIE_PARTITION_BYTES) {
+    budgetEl.classList.add("warn");
+    sendBtn.disabled = true;
+    setStatus(`Too big — ${frames.length} frames exceed the device's capacity. Use a shorter GIF.`, "err");
+  } else {
+    budgetEl.classList.remove("warn");
+    sendBtn.disabled = false;
+    setStatus("Ready. This is exactly how it will look on the device.", "ok");
+  }
+}
+
+// Loop the converted frames on the preview canvas at their real delays.
+function playPreview(frames, delays) {
+  const ctx = $("preview").getContext("2d");
+  const img = ctx.createImageData(W, H);
+  let i = 0;
+  const tickPreview = () => {
+    const packed = frames[i];
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const on = (packed[(y >> 3) * W + x] >> (y & 7)) & 1;
+        const d = (y * W + x) * 4;
+        img.data[d] = on ? 0x4a : 0;          // cyan-tinted, like the panel
+        img.data[d + 1] = on ? 0xe0 : 0;
+        img.data[d + 2] = on ? 0xf0 : 0;
+        img.data[d + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    const delay = delays[i];
+    i = (i + 1) % frames.length;
+    previewTimer = setTimeout(tickPreview, delay);
+  };
+  tickPreview();
+}
+
+// --- Upload ----------------------------------------------------------------
+sendBtn.addEventListener("click", async () => {
+  if (!movieBlob) return;
+  sendBtn.disabled = true;
+  setStatus("Uploading to the device…");
+  try {
+    const resp = await fetch("/upload", { method: "POST", body: movieBlob });
+    if (resp.ok) {
+      setStatus("Done — the device is rebooting into your movie.", "ok");
+    } else {
+      setStatus("Upload failed (HTTP " + resp.status + ").", "err");
+      sendBtn.disabled = false;
+    }
+  } catch (e) {
+    // The device reboots right after replying, which can look like a dropped
+    // connection — if the screen changed, the upload landed.
+    setStatus("Upload sent. If the screen changed, it worked — rejoin the JusticeTattoo Wi-Fi.", "ok");
+  }
+});
+</script>
+</body>
+</html>

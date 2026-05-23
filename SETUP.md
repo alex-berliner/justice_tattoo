@@ -97,7 +97,7 @@ cargo build
 the framework. Everything is cached afterwards — later builds take seconds.
 
 `build.rs` runs on every build and prints a `cargo:warning` line reporting the
-movie's frame count and total byte size.
+default movie's frame count and JTM1 blob size.
 
 ---
 
@@ -123,23 +123,37 @@ espflash monitor
 
 ---
 
-## 7. Swapping in the real movie
+## 7. Loading a movie
 
-1. Replace `assets/movie.gif` with your GIF (any size — it is stretched to
-   128×64).
-2. `cargo build` — `build.rs` re-runs automatically (`rerun-if-changed`).
+### Over Wi-Fi — the normal way (no tools, no cable)
 
-Frames are stored raw (1024 bytes each) or XOR-delta + RLE compressed —
-`build.rs` picks whichever is smaller and prints the result as a `cargo:warning`.
-Movies with static regions compress a lot; busy ones approach 1 KB/frame. The
-`SINGLE_APP_LARGE` partition gives a ~1.5 MB app partition; the firmware, the std
-runtime, and all frames must fit inside it together.
+The device hosts its own network and an upload page:
 
-Regenerate the placeholder instead:
+1. Join the **`JusticeTattoo 192.168.71.1`** Wi-Fi network (password
+   `justicetattoo`) — the network name itself carries the address.
+2. The upload page opens automatically (captive portal). If it does not, open
+   `http://192.168.71.1/` in any browser.
+3. Drop in a `.gif`. The browser converts it; check the preview and the
+   capacity bar, then **Send to device**.
+4. The device stores the movie in its `movie` flash partition and reboots into
+   it. Rejoin the Wi-Fi to upload another.
 
-```bash
-python3 tools/make_placeholder_gif.py
-```
+The GIF is decoded and dithered entirely in the browser — see
+[`web/index.html`](./web/index.html). Anyone can do this: no Rust toolchain, no
+cable, just a modern browser.
+
+### The baked-in default movie
+
+`assets/movie.gif` is converted at compile time and baked into the firmware as
+the default — what a freshly flashed device plays before any upload, and the
+fallback if the `movie` partition is blank or corrupt.
+
+1. Replace `assets/movie.gif` (any size — it is stretched to 128×64).
+2. `cargo build` — `build.rs` re-runs automatically (`rerun-if-changed`) and
+   emits a JTM1 blob, raw or XOR-delta + RLE, whichever is smaller.
+3. Reflash. The default lives in the app partition, so keep it short.
+
+Regenerate the placeholder GIF with `python3 tools/make_placeholder_gif.py`.
 
 ---
 
@@ -148,23 +162,28 @@ python3 tools/make_placeholder_gif.py
 ```
 justicetattoo/
 ├── PLAN.md               # design decisions & rationale
+├── README.md             # overview
 ├── SETUP.md              # this file
 ├── Cargo.toml            # deps: esp-idf-svc, embedded-hal; build-deps: image, embuild
-├── build.rs              # GIF → frames.bin + meta.rs, then ESP-IDF link setup
+├── build.rs              # GIF → default_movie.bin (JTM1), then ESP-IDF link setup
+├── partitions.csv        # custom flash table: factory app + 2 MB movie partition
 ├── rust-toolchain.toml   # channel = "esp"
-├── sdkconfig.defaults    # flash size, large-app partition table, task stack
+├── sdkconfig.defaults    # flash size, custom partition table, task stack
 ├── .cargo/config.toml    # target, linker, runner, build-std, ESP_IDF_VERSION
-├── assets/movie.gif      # the movie (placeholder until replaced)
+├── assets/movie.gif      # the default (baked-in) movie
+├── web/index.html        # the browser upload page + GIF→JTM1 converter
 ├── tools/
 │   ├── make_placeholder_gif.py
 │   └── rle_roundtrip.rs  # host test: delta+RLE encoder vs decoder
 └── src/
-    ├── main.rs           # peripheral init, playback loop, delta+RLE decoder
-    └── ssd1309.rs        # minimal SSD1309 driver (init + full-frame blit)
+    ├── main.rs           # bring-up + playback loop
+    ├── ssd1309.rs        # minimal SSD1309 driver (init + full-frame blit)
+    ├── movie.rs          # JTM1 parsing + movie-partition I/O
+    └── net.rs            # Wi-Fi SoftAP + HTTP upload server + captive DNS
 ```
 
-Generated at build time (not committed): `target/`, and inside `OUT_DIR`
-`frames.bin` (packed frames) and `meta.rs` (`FRAME_COUNT`, `FRAME_DELAYS_MS`, …).
+Generated at build time (not committed): `target/`, and
+`OUT_DIR/default_movie.bin` — the baked-in default movie as a JTM1 blob.
 
 ---
 
@@ -214,5 +233,8 @@ MTMS=GPIO14, MTDO=GPIO15, + GND. Drive it with `probe-rs`
 | Permission denied on `/dev/ttyUSB*` | Confirm membership in `dialout`/`plugdev` (`groups`), then re-login. |
 | `Failed to connect to on-device flash` | ESP-Prog JTAG straps flash to 1.8 V — burn the flash-voltage eFuse, see §9. |
 | `espflash monitor`: *Failed to initialize input reader* | Monitor needs an interactive terminal; run it from a real shell, not a script. |
-| App image too large to flash | Movie has too many frames — shorten the GIF (each frame = 1 KB), or build with `--release`. |
+| App image too large to flash | The firmware outgrew the 1.875 MB `factory` partition — build with `--release`, or shrink the baked-in `assets/movie.gif`. |
+| No `JusticeTattoo …` Wi-Fi network appears | Wi-Fi failed to start — check the serial monitor. The device still plays the default movie. |
+| Upload page errors converting a GIF | The file isn't a valid GIF (e.g. a renamed WebP/APNG) — re-export it as a standard GIF. |
+| Uploaded movie too big | The capacity bar on the page exceeded 100% — use a shorter GIF; the `movie` partition is ~2 MB. |
 | First build seems hung | It is cloning + compiling ESP-IDF. Check progress: `tail -f /tmp/justicetattoo-build.log`. |

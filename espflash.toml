@@ -1,0 +1,5 @@
+# Flashing config for espflash (the `cargo run` runner). Points it at the custom
+# partition table so the app and the `movie` partition land at the right offsets
+# (see partitions.csv).
+[idf_format_args]
+partition_table = "partitions.csv"
