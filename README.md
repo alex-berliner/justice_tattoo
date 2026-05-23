@@ -95,3 +95,5 @@ assets/movie.gif      the default (baked-in) movie
   SoftAP/browser-conversion architecture, the flash budget, delta+RLE.
 - **[SETUP.md](./SETUP.md)** — repeatable setup, build, flash, JTAG, and a
   troubleshooting table.
+- **[Bringup session](https://claude.ai/code/session_01R1z4n3NVJZs5vExZaETG5C)** —
+  the Claude Code conversation that designed and built the project.
