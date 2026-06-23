@@ -1,8 +1,10 @@
-# justicetattoo
+# OLED Tattoo
 
 ESP32 firmware, written in Rust, that plays a short looping "movie" on a
 transparent OLED — and lets you **change the movie from a phone, over Wi-Fi, with
 no app, no cable, and no tools**.
+
+![The OLED movie player in action](assets/demo.gif)
 
 The device hosts its own Wi-Fi network and a web page. Drop a GIF onto the page;
 your browser converts it to display-ready frames and sends them to the device,
